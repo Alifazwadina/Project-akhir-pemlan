@@ -1,0 +1,201 @@
+# server code
+import socket
+import threading
+import pandas as pd
+
+class InventoryServer:
+    def __init__(self):
+        self.books = pd.DataFrame(columns=['Title', 'Author'])
+        self.server_address = ('localhost', 12345)
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.bind(self.server_address)
+        self.server_socket.listen(5)
+        self.export_lock = threading.Lock()
+        self.import_lock = threading.Lock()
+
+    def run_server(self):
+        print("Server is running. Waiting for connections...")
+        while True:
+            client_socket, client_address = self.server_socket.accept()
+            threading.Thread(target=self.handle_client, args=(client_socket,)).start()
+
+    def handle_client(self, client_socket):
+        with client_socket:
+            print(f"Connection from {client_socket.getpeername()}")
+
+            data = client_socket.recv(1024).decode()
+
+            if data == 'ADD_BOOK':
+                self.add_book(client_socket)
+            elif data == 'REMOVE_BOOK':
+                self.remove_book(client_socket)
+            elif data == 'DISPLAY_BOOKS':
+                self.display_books(client_socket)
+            elif data == 'SEARCH_BOOK':
+                self.search_book(client_socket)
+            elif data == 'EXPORT_DATA':
+                self.export_data(client_socket)
+            elif data == 'IMPORT_DATA':
+                self.import_data(client_socket)
+            elif data == 'EDIT_BOOK':
+                self.edit_book(client_socket)
+
+    def add_book(self, client_socket):
+        with self.export_lock:
+            title = client_socket.recv(1024).decode()
+            author = client_socket.recv(1024).decode()
+            new_book = pd.DataFrame({'Title': [title], 'Author': [author]})
+            self.books = pd.concat([self.books, new_book], ignore_index=True)
+            client_socket.sendall(b'Book added successfully.')
+
+    def remove_book(self, client_socket):
+        with self.export_lock:
+            title = client_socket.recv(1024).decode()
+            self.books = self.books[self.books['Title'] != title]
+            client_socket.sendall(b'Book removed successfully.')
+
+    def display_books(self, client_socket):
+        books_str = self.books.to_string(index=False)
+        client_socket.sendall(books_str.encode())
+
+    def search_book(self, client_socket):
+        title = client_socket.recv(1024).decode()
+        result = self.books[self.books['Title'].str.contains(title, case=False)]
+        result_str = result.to_string(index=False)
+        client_socket.sendall(result_str.encode())
+
+    def export_data(self, client_socket):
+        with self.export_lock:
+            print("Exporting data to client.")
+            client_socket.sendall(b'READY')
+            data = self.books.to_csv(index=False).encode()
+            client_socket.sendall(data)
+
+    def import_data(self, client_socket):
+        with self.import_lock:
+            print("Importing data from client.")
+            client_socket.sendall(b'READY')
+            data = client_socket.recv(4096).decode()
+            new_books = pd.read_csv(pd.compat.StringIO(data))
+
+            # Update local inventory
+            self.books = pd.concat([self.books, new_books], ignore_index=True)
+
+    def edit_book(self, client_socket):
+        with self.export_lock:
+            old_title = client_socket.recv(1024).decode()
+            new_title = client_socket.recv(1024).decode()
+            self.books.loc[self.books['Title'] == old_title, 'Title'] = new_title
+            client_socket.sendall(b'Book edited successfully.')
+
+if __name__ == "__main__":
+    server = InventoryServer()
+    server.run_server()
+
+# =================================================================================
+# client code
+import socket
+import tkinter as tk
+from tkinter import ttk, simpledialog, messagebox
+import pandas as pd
+import threading
+
+class InventoryClient:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("Inventory Client")
+        self.books = pd.DataFrame(columns=['Title', 'Author'])
+        self.create_widgets()
+
+    def create_widgets(self):
+        self.sync_button = ttk.Button(self.master, text="Sync with Server", command=self.sync_with_server)
+        self.sync_button.pack(pady=10)
+
+        self.book_listbox = tk.Listbox(self.master, height=10, selectmode=tk.SINGLE)
+        self.book_listbox.pack(pady=10)
+
+        self.add_book_button = ttk.Button(self.master, text="Add Book", command=self.add_book)
+        self.add_book_button.pack(pady=5)
+
+        self.remove_book_button = ttk.Button(self.master, text="Remove Book", command=self.remove_book)
+        self.remove_book_button.pack(pady=5)
+
+        self.edit_book_button = ttk.Button(self.master, text="Edit Book", command=self.edit_book)
+        self.edit_book_button.pack(pady=5)
+
+        self.display_books()
+
+    def sync_with_server(self):
+        threading.Thread(target=self.export_data).start()
+        threading.Thread(target=self.import_data).start()
+
+    def export_data(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect(('localhost', 12345))
+            s.sendall(b'EXPORT_DATA')
+            response = s.recv(1024).decode()
+
+            if response == 'READY':
+                data = s.recv(4096).decode()
+                new_books = pd.read_csv(pd.compat.StringIO(data))
+
+                # Update local inventory
+                self.books = pd.concat([self.books, new_books], ignore_index=True)
+                self.display_books()
+
+    def import_data(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect(('localhost', 12345))
+            s.sendall(b'IMPORT_DATA')
+            response = s.recv(1024).decode()
+
+            if response == 'READY':
+                s.sendall(self.books.to_csv(index=False).encode())
+                messagebox.showinfo("Import", "Data synced with server.")
+
+    def add_book(self):
+        title = simpledialog.askstring("Add Book", "Enter book title:")
+        author = simpledialog.askstring("Add Book", "Enter author:")
+        if title and author:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect(('localhost', 12345))
+                s.sendall(b'ADD_BOOK')
+                s.sendall(title.encode())
+                s.sendall(author.encode())
+                response = s.recv(1024).decode()
+                messagebox.showinfo("Add Book", response)
+                self.sync_with_server()
+
+    def remove_book(self):
+        selected_title = self.book_listbox.get(tk.ACTIVE)
+        if selected_title:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect(('localhost', 12345))
+                s.sendall(b'REMOVE_BOOK')
+                s.sendall(selected_title.encode())
+                response = s.recv(1024).decode()
+                messagebox.showinfo("Remove Book", response)
+                self.sync_with_server()
+
+    def edit_book(self):
+        selected_title = self.book_listbox.get(tk.ACTIVE)
+        if selected_title:
+            new_title = simpledialog.askstring("Edit Book", f"Enter new title for {selected_title}:")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect(('localhost', 12345))
+                s.sendall(b'EDIT_BOOK')
+                s.sendall(selected_title.encode())
+                s.sendall(new_title.encode())
+                response = s.recv(1024).decode()
+                messagebox.showinfo("Edit Book", response)
+                self.sync_with_server()
+
+    def display_books(self):
+        self.book_listbox.delete(0, tk.END)
+        for _, row in self.books.iterrows():
+            self.book_listbox.insert(tk.END, f"{row['Title']} - {row['Author']}")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = InventoryClient(root)
+    root.mainloop()
